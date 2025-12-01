@@ -41,7 +41,7 @@ app.post('/send-alert', async (req, res) => {
   try {
     const message = {
       notification: {
-        title: `📊 تحديث مباشر - ${area}`,
+        title: `📊 مرحبا اية - ${area}`,
         body: `💧 المنسوب: ${water_level.toFixed(1)} سم\n⚗️ pH: ${ph.toFixed(2)}`
       },
       topic: area
