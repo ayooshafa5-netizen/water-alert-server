@@ -1,138 +1,83 @@
-const express = require('express');
-const admin = require('firebase-admin');
-const app = express();
+import express from "express";
+import bodyParser from "body-parser";
+import admin from "firebase-admin";
+import dotenv from "dotenv";
 
-// ============== Firebase Service Account ==============
+dotenv.config();
+
+const app = express();
+app.use(bodyParser.json());
+
+// تحميل مفتاح الخدمة من متغيرات البيئة (Render)
 const serviceAccount = {
-  type: "service_account",
-  project_id: process.env.FIREBASE_PROJECT_ID,
-  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-  client_email: process.env.FIREBASE_CLIENT_EMAIL,
-  client_id: process.env.FIREBASE_CLIENT_ID,
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token",
-  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
+  type: process.env.FB_TYPE,
+  project_id: process.env.FB_PROJECT_ID,
+  private_key_id: process.env.FB_PRIVATE_KEY_ID,
+  private_key: process.env.FB_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  client_email: process.env.FB_CLIENT_EMAIL,
+  client_id: process.env.FB_CLIENT_ID,
+  auth_uri: process.env.FB_AUTH_URI,
+  token_uri: process.env.FB_TOKEN_URI,
+  auth_provider_x509_cert_url: process.env.FB_AUTH_CERT,
+  client_x509_cert_url: process.env.FB_CLIENT_CERT,
 };
 
-// ============== Firebase Admin Init ==============
+// تهيئة Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: "https://YOUR_PROJECT_ID.europe-west1.firebasedatabase.app"
+  databaseURL:
+    "https://watermoitoringsystem-default-rtdb.europe-west1.firebasedatabase.app",
 });
 
-app.use(express.json());
+// اتصال القاعدة
+const db = admin.database();
 
-// =====================================================
-//         نقطة استقبال البيانات من ESP32
-// =====================================================
-app.post('/send-alert', async (req, res) => {
+// نقطة استقبال بيانات ESP32
+app.post("/send-data", async (req, res) => {
   try {
     const { area, water_level, ph } = req.body;
 
-    if (!area) return res.status(400).json({ error: "area مفقودة" });
+    console.log("بيانات مستلمة:", req.body);
 
-    console.log("بيانات مستلمة:", { area, water_level, ph });
+    // جلب الحدود من القاعدة
+    const thresholdsSnap = await db.ref("settings/thresholds").once("value");
 
-    // ============ جلب الحدود من القاعدة ============
-    const thresholdsSnap = await admin
-      .database()
-      .ref("settings/thresholds")
-      .once("value");
+    if (!thresholdsSnap.exists()) {
+      console.error("لا توجد حدود في settings/thresholds");
+      return res.status(500).send("Thresholds not found");
+    }
 
     const thresholds = thresholdsSnap.val();
-    const { level_min, level_max, ph_min, ph_max } = thresholds;
 
-    // ============ تحديد نوع الخطر ============
-    let alertText = "";
-    let isDanger = false;
+    const dangerWater =
+      water_level < thresholds.min_water || water_level > thresholds.max_water;
 
-    if (water_level < level_min) {
-      alertText += `⚠️ مستوى الماء منخفض (${water_level} سم)\n`;
-      isDanger = true;
-    }
-    if (water_level > level_max) {
-      alertText += `⚠️ مستوى الماء مرتفع (${water_level} سم)\n`;
-      isDanger = true;
-    }
-    if (ph < ph_min) {
-      alertText += `⚠️ قيمة pH منخفضة (حمضية أكثر من اللازم) – ${ph}\n`;
-      isDanger = true;
-    }
-    if (ph > ph_max) {
-      alertText += `⚠️ قيمة pH مرتفعة (قلوية أكثر من اللازم) – ${ph}\n`;
-      isDanger = true;
+    const dangerPH = ph < thresholds.min_ph || ph > thresholds.max_ph;
+
+    // إذا لم يكن هناك أي خطر → إنهاء
+    if (!dangerWater && !dangerPH) {
+      return res.send("No danger detected");
     }
 
-    // إذا لا يوجد خطر
-    if (!isDanger) {
-      alertText = `القراءات طبيعية:\n💧 المنسوب: ${water_level} سم\n⚗️ pH: ${ph}`;
-    }
-
-    // ============ حفظ القراءة في القاعدة ============
-    await admin
-      .database()
-      .ref(`readings/${area}`)
-      .push({
-        water_level,
-        ph,
-        timestamp: Date.now()
-      });
-
-    // ============ تجهيز رسالة FCM ============
+    // إرسال إشعار FCM
     const message = {
-      topic: area,
       notification: {
-        title: `📡 تحديث جديد - ${area}`,
-        body: alertText
-      }
+        title: "تحذير من النظام",
+        body: `منطقة ${area}: مستوى الماء ${water_level}, pH = ${ph}`,
+      },
+      topic: "alerts",
     };
 
-    // إذا يوجد خطر → يرسل إشعار
-    let fcmResponse = null;
-    if (isDanger) {
-      fcmResponse = await admin.messaging().send(message);
-      console.log("تم إرسال إشعار:", fcmResponse);
-    } else {
-      console.log("لا يوجد خطر — لم يُرسل إشعار.");
-    }
+    await admin.messaging().send(message);
 
-    return res.json({
-      status: "تم الاستقبال",
-      danger: isDanger,
-      sent_notification: !!isDanger,
-      fcmResponse
-    });
-
+    console.log("تم إرسال إشعار");
+    res.send("Notification sent");
   } catch (error) {
-    console.error("خطأ:", error);
-    return res.status(500).json({ error: error.message });
+    console.error("خطأ أثناء معالجة الطلب:", error);
+    res.status(500).send("Error processing request");
   }
 });
 
-// =====================================================
-//     اختبار إرسال إشعار يدوي
-// =====================================================
-app.get('/test-alert', async (req, res) => {
-  const topic = "rwmaya";
-
-  try {
-    const resp = await admin.messaging().send({
-      topic,
-      notification: {
-        title: "اختبار",
-        body: "نجاح الاختبار"
-      }
-    });
-
-    return res.json({ sent: true, resp });
-
-  } catch (error) {
-    return res.status(500).json({ error: error.message });
-  }
-});
-
-// =====================================================
+// تشغيل السيرفر
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
