@@ -1,83 +1,102 @@
 import express from "express";
-import bodyParser from "body-parser";
 import admin from "firebase-admin";
-import dotenv from "dotenv";
-
-dotenv.config();
 
 const app = express();
-app.use(bodyParser.json());
 
-// تحميل مفتاح الخدمة من متغيرات البيئة (Render)
+// -----------------------
+//  Firebase Credentials
+// -----------------------
 const serviceAccount = {
-  type: process.env.FB_TYPE,
-  project_id: process.env.FB_PROJECT_ID,
-  private_key_id: process.env.FB_PRIVATE_KEY_ID,
-  private_key: process.env.FB_PRIVATE_KEY.replace(/\\n/g, "\n"),
-  client_email: process.env.FB_CLIENT_EMAIL,
-  client_id: process.env.FB_CLIENT_ID,
-  auth_uri: process.env.FB_AUTH_URI,
-  token_uri: process.env.FB_TOKEN_URI,
-  auth_provider_x509_cert_url: process.env.FB_AUTH_CERT,
-  client_x509_cert_url: process.env.FB_CLIENT_CERT,
+  type: "service_account",
+  project_id: process.env.FIREBASE_PROJECT_ID,
+  private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+  private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, "\n"),
+  client_email: process.env.FIREBASE_CLIENT_EMAIL,
+  client_id: process.env.FIREBASE_CLIENT_ID,
+  auth_uri: "https://accounts.google.com/o/oauth2/auth",
+  token_uri: "https://oauth2.googleapis.com/token",
+  auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+  client_x509_cert_url: process.env.FIREBASE_CLIENT_CERT_URL
 };
 
-// تهيئة Firebase Admin
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL:
-    "https://watermoitoringsystem-default-rtdb.europe-west1.firebasedatabase.app",
+  databaseURL: "https://watermoitoringsystem-default-rtdb.europe-west1.firebasedatabase.app"
 });
 
-// اتصال القاعدة
 const db = admin.database();
 
-// نقطة استقبال بيانات ESP32
-app.post("/send-data", async (req, res) => {
+app.use(express.json());
+
+// ----------------------------------------------------
+//      استقبال بيانات ESP32 + مقارنة الحدود
+// ----------------------------------------------------
+app.post("/send-alert", async (req, res) => {
   try {
     const { area, water_level, ph } = req.body;
 
-    console.log("بيانات مستلمة:", req.body);
+    if (!area) return res.status(400).json({ error: "area مفقودة" });
 
-    // جلب الحدود من القاعدة
+    console.log("🚰 بيانات مستلمة:", { area, water_level, ph });
+
+    // --- 1) تحميل الحدود من settings/thresholds ---
     const thresholdsSnap = await db.ref("settings/thresholds").once("value");
-
-    if (!thresholdsSnap.exists()) {
-      console.error("لا توجد حدود في settings/thresholds");
-      return res.status(500).send("Thresholds not found");
-    }
-
     const thresholds = thresholdsSnap.val();
 
-    const dangerWater =
-      water_level < thresholds.min_water || water_level > thresholds.max_water;
-
-    const dangerPH = ph < thresholds.min_ph || ph > thresholds.max_ph;
-
-    // إذا لم يكن هناك أي خطر → إنهاء
-    if (!dangerWater && !dangerPH) {
-      return res.send("No danger detected");
+    if (!thresholds) {
+      return res.status(500).json({ error: "لم يتم العثور على الحدود في القاعدة" });
     }
 
-    // إرسال إشعار FCM
+    const { level_min, level_max, ph_min, ph_max } = thresholds;
+
+    // --- 2) تحديد نوع التنبيه ---
+    let alertMessage = "";
+
+    if (water_level < level_min) alertMessage += "⚠️ مستوى الماء منخفض جدًا!\n";
+    if (water_level > level_max) alertMessage += "⚠️ مستوى الماء مرتفع جدًا!\n";
+
+    if (ph < ph_min) alertMessage += "⚗️ الماء حامضي أكثر من الطبيعي!\n";
+    if (ph > ph_max) alertMessage += "⚗️ الماء قلوي أكثر من الطبيعي!\n";
+
+    // إن لم يوجد مخالفات → تحديث فقط بدون خطر
+    if (alertMessage === "") {
+      alertMessage = "📡 تحديث طبيعي للبيانات.\n";
+    }
+
+    // --- 3) بناء رسالة الإشعار ---
     const message = {
       notification: {
-        title: "تحذير من النظام",
-        body: `منطقة ${area}: مستوى الماء ${water_level}, pH = ${ph}`,
+        title: `📢 تنبيه - منطقة ${area}`,
+        body:
+          `${alertMessage}\n` +
+          `💧 المنسوب: ${water_level.toFixed(1)} سم\n` +
+          `⚗️ pH: ${ph.toFixed(2)}`
       },
-      topic: "alerts",
+      topic: area
     };
 
-    await admin.messaging().send(message);
+    // --- 4) إرسال الإشعار ---
+    const response = await admin.messaging().send(message);
 
-    console.log("تم إرسال إشعار");
-    res.send("Notification sent");
-  } catch (error) {
-    console.error("خطأ أثناء معالجة الطلب:", error);
-    res.status(500).send("Error processing request");
+    console.log("📨 إشعار أرسل:", response);
+
+    res.json({
+      status: "تم إرسال الإشعار",
+      checked_thresholds: thresholds,
+      response
+    });
+
+  } catch (err) {
+    console.error("❌ خطأ:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// تشغيل السيرفر
+// ----------------------------------------------------
+app.get("/", (req, res) => {
+  res.send("Water alert server is running...");
+});
+// ----------------------------------------------------
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
