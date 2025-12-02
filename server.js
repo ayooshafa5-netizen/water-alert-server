@@ -39,49 +39,63 @@ app.post("/send-alert", async (req, res) => {
 
     console.log("🚰 بيانات مستلمة:", { area, water_level, ph });
 
-    // --- 1) تحميل الحدود من settings/thresholds ---
+    // --- 1) تحميل الحدود ---
     const thresholdsSnap = await db.ref("settings/thresholds").once("value");
     const thresholds = thresholdsSnap.val();
 
-    if (!thresholds) {
-      return res.status(500).json({ error: "لم يتم العثور على الحدود في القاعدة" });
-    }
-
     const { level_min, level_max, ph_min, ph_max } = thresholds;
 
-    // --- 2) تحديد نوع التنبيه ---
+    // --- 2) تحديد المشكلة بالضبط ---
     let alertMessage = "";
+    let alertDetails = "";
 
-    if (water_level < level_min) alertMessage += "⚠️ مستوى الماء منخفض جدًا!\n";
-    if (water_level > level_max) alertMessage += "⚠️ مستوى الماء مرتفع جدًا!\n";
-
-    if (ph < ph_min) alertMessage += "⚗️ الماء حامضي أكثر من الطبيعي!\n";
-    if (ph > ph_max) alertMessage += "⚗️ الماء قلوي أكثر من الطبيعي!\n";
-
-    // إن لم يوجد مخالفات → تحديث فقط بدون خطر
-    if (alertMessage === "") {
-      alertMessage = "📡 تحديث طبيعي للبيانات.\n";
+    // *** مستوى الماء فقط ***
+    if (water_level < level_min) {
+      alertMessage += "⚠️ مستوى الماء منخفض!\n";
+      alertDetails += `💧 المنسوب الحالي: ${water_level.toFixed(1)} سم\n`;
     }
 
-    // --- 3) بناء رسالة الإشعار ---
+    if (water_level > level_max) {
+      alertMessage += "⚠️ مستوى الماء مرتفع!\n";
+      alertDetails += `💧 المنسوب الحالي: ${water_level.toFixed(1)} سم\n`;
+    }
+
+    // *** pH فقط ***
+    if (ph < ph_min) {
+      alertMessage += "⚗️ الماء حامضي أكثر من الطبيعي!\n";
+      alertDetails += `⚗️ قيمة pH: ${ph.toFixed(2)}\n`;
+    }
+
+    if (ph > ph_max) {
+      alertMessage += "⚗️ الماء قلوي أكثر من الطبيعي!\n";
+      alertDetails += `⚗️ قيمة pH: ${ph.toFixed(2)}\n`;
+    }
+
+    // --- 3) كل القيم طبيعية → لا إشعار ---
+    if (alertMessage === "") {
+      console.log("✔️ القراءات طبيعية — لا إشعار");
+      return res.json({
+        status: "normal",
+        message: "القراءات طبيعية — لم يتم إرسال إشعار"
+      });
+    }
+
+    // --- 4) إرسال الإشعار — يحتوي فقط القيم المخالفة ---
     const message = {
       notification: {
         title: `📢 تنبيه - منطقة ${area}`,
-        body:
-          `${alertMessage}\n` +
-          `💧 المنسوب: ${water_level.toFixed(1)} سم\n` +
-          `⚗️ pH: ${ph.toFixed(2)}`
+        body: alertMessage + "\n" + alertDetails
       },
       topic: area
     };
 
-    // --- 4) إرسال الإشعار ---
     const response = await admin.messaging().send(message);
-
     console.log("📨 إشعار أرسل:", response);
 
     res.json({
-      status: "تم إرسال الإشعار",
+      status: "alert_sent",
+      alertMessage,
+      alertDetails,
       checked_thresholds: thresholds,
       response
     });
